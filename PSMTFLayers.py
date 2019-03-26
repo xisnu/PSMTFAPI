@@ -1,7 +1,7 @@
 from __future__ import print_function
-import tensorflow as tf
-import keras.backend as K
+
 from PSMUtils import *
+
 
 class MyDenseLayer(tf.keras.layers.Layer):
     def __init__(self, num_outputs):
@@ -63,6 +63,42 @@ class SimpleLoop:
             feed={self.model_input:data}
             out=sess.run(self.output,feed_dict=feed)
             print(out)
+
+class SimpleNestedLoop:
+    def __init__(self,ts,nbfeat):
+        self.model=tf.Graph()
+        self.ts=ts
+        self.nbfeat=nbfeat
+        self.Ws=4
+        self.t=0
+
+    def build(self):
+        with self.model.as_default():
+            self.model_input=tf.placeholder(tf.float32,[None,self.ts,self.nbfeat])
+            self.step_output=[]
+            self.output=self.loop_over_timesteps(self.model_input)
+
+    def for_each_step(self,t,ts):
+        #data[index]=data[index]+1
+        index=t+1
+        return [index,ts]
+
+    def condition(self,t,ts):
+        return tf.less(t,ts)
+
+    def loop_over_timesteps(self,X):#X=ts,N,F
+        input_sequence=tf.transpose(X,[1,0,2])
+        t=0
+        self.ts=tf.constant(get_layer_shape(input_sequence)[0],dtype=tf.int32)
+        r=tf.while_loop(self.condition,self.for_each_step,[t,self.ts],return_same_structure=True)
+        return r
+
+    def run(self,data):
+        with tf.Session(graph=self.model) as sess:
+            feed={self.model_input:data}
+            out=sess.run([self.step_output],feed_dict=feed)
+            print(out)
+
 
 class psmRNNCell(object):
     def __init__(self,nodes,name):
@@ -362,4 +398,86 @@ def psmCrossEntropyLoss(predict,labels):
     loss=tf.reduce_mean(tf.reduce_sum(labels*tf.log(predict),axis=-1))
     return loss
 
+class psmTransducer(object):
+    def __init__(self,nodes,name,windowsize=5):
+        self.nodes=nodes
+        self.name=name
+        self.window_size=windowsize
+
+    def build(self,input_shape):
+        self.input_shape=input_shape
+        self.input_dim = self.input_shape[-1]
+        self.T=self.input_shape[-2]
+        with tf.variable_scope(self.name,reuse=tf.AUTO_REUSE):
+            self.Wk = tf.get_variable('Wk', shape=[self.input_dim, self.nodes])
+            tf.summary.histogram('Wk',self.Wk)
+            self.Wr = tf.get_variable('Wr', shape=[self.nodes, self.nodes])
+            tf.summary.histogram('Wr', self.Wr)
+            self.Ir = tf.get_variable('Initial_state',shape=[self.input_dim,self.nodes],trainable=False)
+        print("RNN built: input shape ", self.input_shape)
+
+    def window_step(self,previous_output,step_input):
+        ci_out = tf.matmul(step_input, self.Wk, name='kernel_mult')
+        po_out = tf.matmul(previous_output, self.Wr, name='recurrent_mult')
+        step_output = tf.tanh(tf.add(ci_out, po_out))
+        return step_output
+
+    def rnn_step(self,previous_output,step_input):
+        self.t=previous_output
+        window=self.input_tm[self.t:self.t+self.window_size-1]
+        tf.scan(self.window_step,window)
+        return self.t+1
+
+    def loop_over_timestep(self,input):
+        self.input_tm=tf.transpose(input,[1,0,2])
+        initial_state=tf.matmul(self.input_tm[0],self.Ir)
+        output_tm=tf.scan(self.rnn_step,self.input_tm,initializer=initial_state)
+        output=tf.transpose(output_tm,[1,0,2])
+        return output
+
+class psmRNNCell_v2(object):
+    def __init__(self,nodes,input_sequence,name):
+        self.nodes=nodes
+        self.name=name
+        self.input_sequence=tf.transpose(input_sequence,[1,0,2])#convert to time major
+
+    def build(self):
+        input_shape=get_layer_shape(self.input_sequence)
+        self.input_dim=input_shape[-1]
+        self.T=input_shape[0]#NOT time major
+        self.W=tf.get_variable('W_'+self.name,shape=[self.input_dim,self.nodes],dtype=tf.float32)#F,H ,initializer='random_uniform'
+        tf.summary.histogram('W_'+self.name,self.W)
+        self.U=tf.get_variable('U_'+self.name,shape=[self.nodes,self.nodes],dtype=tf.float32)#H,H,initializer='random_uniform'
+        tf.summary.histogram('U_'+self.name,self.U)
+        self.bias=tf.get_variable('Bias_'+self.name,shape=[self.nodes],dtype=tf.float32)#H,initializer='random_uniform'
+        self.Winit=tf.zeros([self.input_dim,self.nodes],dtype=tf.float32,name='Winit')
+
+    def stop_loop_if(self,t,prev_out,output_sequence):
+        return tf.less(t,self.T)
+
+    def rnn_op(self,t,prev_out,output_sequence):
+        current_input=self.input_sequence[t]#N,F
+        current_output=tf.tanh(tf.matmul(current_input,self.W,name='input_nodes')+tf.matmul(prev_out,self.U,name='nodes_nodes')+self.bias)#N,H
+        output_sequence=output_sequence.write(t,current_output)
+        t=t+1
+        return [t,current_output,output_sequence]
+
+    def rnn(self):
+        initial_state=tf.matmul(self.input_sequence[0],self.Winit,name='initial_state')#N,H
+        output_sequence = tf.TensorArray(tf.float32, size=self.T)
+        T,_,Y=tf.while_loop(self.stop_loop_if,self.rnn_op,[0,initial_state,output_sequence])
+        Y=Y.concat()
+        Y=tf.reshape(Y,[self.T,-1,self.nodes])
+        return Y
+
+
+def psmRNN_v2(nodes,input,name,return_time_major=False,return_sequence=True):
+    rnncell=psmRNNCell_v2(nodes,input,name)
+    rnncell.build()
+    output=rnncell.rnn()
+    if (not return_sequence):
+        return output[-1]
+    if(not return_time_major):
+        output=tf.transpose(output,[1,0,2])
+    return output
 
